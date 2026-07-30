@@ -29,11 +29,10 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Build APK (arm64, unsigned)
+      - name: Build APK (arm64, debug)
         run: flutter build apk --debug --target-platform android-arm64
-
       - name: Upload Android artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-arm64-apk
-          path: build/app/outputs/flutter-apk/app-release-unsigned.apk
+          path: build/app/outputs/flutter-apk/app-debug.apk

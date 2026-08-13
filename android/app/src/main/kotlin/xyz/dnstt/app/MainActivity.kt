@@ -131,9 +131,10 @@ class MainActivity : FlutterActivity() {
                     val sshPassword = call.argument<String>("sshPassword")
                     val sshPrivateKey = call.argument<String>("sshPrivateKey")
                     val shareProxy = call.argument<Boolean>("shareProxy") ?: false
+                    val proxyPort = call.argument<Int>("proxyPort") ?: 1080
                     connectSshTunnel(
                         dnsServer, tunnelDomain, publicKey,
-                        sshUsername, sshPassword, sshPrivateKey, shareProxy, result
+                        sshUsername, sshPassword, sshPrivateKey, shareProxy, proxyPort, result
                     )
                 }
                 "connectSshTunnelVpn" -> {
@@ -698,6 +699,7 @@ class MainActivity : FlutterActivity() {
         sshPassword: String?,
         sshPrivateKey: String?,
         shareProxy: Boolean,
+        proxyPort: Int,
         result: MethodChannel.Result
     ) {
         if (isSshTunnelRunning.get()) {
@@ -718,18 +720,19 @@ class MainActivity : FlutterActivity() {
                 // Wait for DNSTT to be ready
                 delay(500)
 
-                // Step 2: Connect SSH client through DNSTT tunnel, SOCKS5 on port 1080
+                // Step 2: Connect SSH client through DNSTT tunnel, SOCKS5 on the configured proxy port
                 sshTunnelClient = SshTunnelClient()
                 val sshConnected = sshTunnelClient?.connect(
                     username = sshUsername,
                     password = sshPassword,
                     privateKey = sshPrivateKey,
-                    shareProxy = shareProxy
+                    shareProxy = shareProxy,
+                    socksPort = proxyPort
                 ) ?: false
 
                 if (sshConnected) {
                     isSshTunnelRunning.set(true)
-                    Log.d("DnsttSsh", "SSH tunnel connected, SOCKS5 proxy on port 1080 (sharing: $shareProxy)")
+                    Log.d("DnsttSsh", "SSH tunnel connected, SOCKS5 proxy on port $proxyPort (sharing: $shareProxy)")
 
                     runOnUiThread {
                         eventSink?.success("ssh_tunnel_connected")
@@ -746,7 +749,7 @@ class MainActivity : FlutterActivity() {
 
                     runOnUiThread {
                         eventSink?.success("ssh_tunnel_error")
-                        result.success(false)
+                        result.error("SSH_ERROR", error, null)
                     }
                 }
             } catch (e: Exception) {
@@ -763,7 +766,7 @@ class MainActivity : FlutterActivity() {
 
                 runOnUiThread {
                     eventSink?.success("ssh_tunnel_error")
-                    result.success(false)
+                    result.error("SSH_ERROR", e.message ?: "Failed to start SSH tunnel", null)
                 }
             }
         }
@@ -898,7 +901,7 @@ class MainActivity : FlutterActivity() {
 
                     runOnUiThread {
                         eventSink?.success("ssh_tunnel_error")
-                        result.success(false)
+                        result.error("SSH_ERROR", error, null)
                     }
                 }
             } catch (e: Exception) {
@@ -912,7 +915,7 @@ class MainActivity : FlutterActivity() {
 
                 runOnUiThread {
                     eventSink?.success("ssh_tunnel_error")
-                    result.success(false)
+                    result.error("SSH_ERROR", e.message ?: "Failed to start SSH tunnel with VPN", null)
                 }
             }
         }

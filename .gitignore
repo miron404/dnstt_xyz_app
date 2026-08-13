@@ -129,3 +129,6 @@ vendor/slipstream-rust/.picoquic-build/
 # Build artifacts - ignore Libraries contents except slipstream-client
 macos/Runner/Libraries/*
 !macos/Runner/Libraries/slipstream-client
+
+
+*.txt

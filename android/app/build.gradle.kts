@@ -75,4 +75,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // JSch for SSH tunneling (dynamic port forwarding through DNSTT)
     implementation("com.github.mwiede:jsch:0.2.18")
+    // BouncyCastle fills in KEX/cipher/host-key algorithms (curve25519-sha256,
+    // ed25519, chacha20-poly1305, ...) that Android's built-in Conscrypt provider
+    // doesn't implement but modern OpenSSH servers commonly require.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 }

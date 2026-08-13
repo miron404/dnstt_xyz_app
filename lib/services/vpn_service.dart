@@ -1094,6 +1094,7 @@ class VpnService {
     required String sshUsername,
     String? sshPassword,
     String? sshPrivateKey,
+    int? proxyPort,
   }) async {
     if (_isDesktop) {
       return _connectSshTunnelDesktop(
@@ -1130,6 +1131,7 @@ class VpnService {
         'sshUsername': sshUsername,
         'sshPassword': sshPassword,
         'sshPrivateKey': sshPrivateKey,
+        'proxyPort': proxyPort ?? this.proxyPort,
       });
 
       if (result == true) {

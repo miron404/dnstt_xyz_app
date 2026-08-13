@@ -5,11 +5,13 @@ import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.ChannelDirectTCPIP
 import kotlinx.coroutines.*
+import org.bouncycastle.jce.provider.BouncyCastleProvider
 import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.Security
 import java.util.Properties
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -17,11 +19,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * SSH Tunnel Client that creates a local SOCKS5 proxy through SSH dynamic port forwarding.
  *
  * Flow:
- * 1. DNSTT creates TCP tunnel to SSH server (127.0.0.1:7000 -> SSH server port 22)
- * 2. This SSH client connects to 127.0.0.1:7000 (which is the SSH server through DNSTT)
- * 3. Sets up SSH dynamic port forwarding (-D equivalent)
- * 4. Creates local SOCKS5 proxy on specified port (e.g., 1080)
- * 5. User apps connect to 127.0.0.1:1080 for proxied internet access
+ * 1. DNSTT creates a raw TCP tunnel on 127.0.0.1:7001, forwarded by the remote
+ *    dnstt-server directly to its sshd (e.g. 127.0.0.1:22 on the server).
+ * 2. This SSH client connects to 127.0.0.1:7001 (which is sshd, reached through DNSTT).
+ * 3. Sets up SSH dynamic port forwarding (-D equivalent).
+ * 4. Creates a local SOCKS5 proxy on the requested port (proxy mode: the user's
+ *    configured proxy port; VPN mode: the fixed internal port DnsttVpnService expects).
+ * 5. User apps (or DnsttVpnService, in VPN mode) connect to that local SOCKS5 proxy.
  */
 class SshTunnelClient {
     companion object {
@@ -46,19 +50,21 @@ class SshTunnelClient {
         private set
 
     /**
-     * Connect to SSH server through DNSTT tunnel and start SOCKS5 proxy on port 1080.
+     * Connect to SSH server through DNSTT tunnel and start a local SOCKS5 proxy.
      *
      * @param username SSH username
      * @param password SSH password (optional if using key)
      * @param privateKey SSH private key in OpenSSH format (optional if using password)
      * @param shareProxy If true, bind to 0.0.0.0 to allow network access; if false, bind to 127.0.0.1
+     * @param socksPort Local port to expose the SOCKS5 proxy on (defaults to [SOCKS5_PROXY_PORT])
      * @return true if connection successful
      */
     suspend fun connect(
         username: String,
         password: String? = null,
         privateKey: String? = null,
-        shareProxy: Boolean = false
+        shareProxy: Boolean = false,
+        socksPort: Int = SOCKS5_PROXY_PORT
     ): Boolean = withContext(Dispatchers.IO) {
         shareProxyEnabled = shareProxy
         try {
@@ -69,6 +75,18 @@ class SshTunnelClient {
 
             lastError = null
             Log.i(TAG, "Connecting SSH through DNSTT tunnel at $DNSTT_TUNNEL_HOST:$DNSTT_TUNNEL_PORT")
+
+            // JSch relies on the JVM's registered security providers to negotiate
+            // KEX/cipher/host-key algorithms. Android's built-in provider (Conscrypt)
+            // does not implement several algorithms modern OpenSSH servers prefer or
+            // require (e.g. curve25519-sha256, ed25519, chacha20-poly1305), which makes
+            // JSch throw "Algorithm negotiation fail" against such servers. Registering
+            // BouncyCastle as an additional (lower-priority) provider lets JSch fall back
+            // to it for anything Conscrypt doesn't support, without overriding Conscrypt
+            // for what it already handles.
+            if (Security.getProvider("BC") == null) {
+                Security.addProvider(BouncyCastleProvider())
+            }
 
             val jsch = JSch()
 
@@ -82,8 +100,8 @@ class SshTunnelClient {
                 }
             }
 
-            // Create session connecting THROUGH the DNSTT tunnel
-            // The DNSTT tunnel (127.0.0.1:7000) forwards to the SSH server
+            // Create session connecting THROUGH the DNSTT tunnel (127.0.0.1:7001),
+            // which the remote dnstt-server forwards directly to its sshd.
             session = jsch.getSession(username, DNSTT_TUNNEL_HOST, DNSTT_TUNNEL_PORT).apply {
                 // Set password if provided
                 if (!password.isNullOrEmpty()) {
@@ -116,11 +134,11 @@ class SshTunnelClient {
 
             Log.i(TAG, "SSH session connected successfully")
 
-            // Start local SOCKS5 proxy with dynamic port forwarding on port 7000
-            startSocksProxy(SOCKS5_PROXY_PORT)
+            // Start local SOCKS5 proxy with dynamic port forwarding
+            startSocksProxy(socksPort)
 
             isRunning.set(true)
-            Log.i(TAG, "SSH tunnel with SOCKS5 proxy started on port $SOCKS5_PROXY_PORT")
+            Log.i(TAG, "SSH tunnel with SOCKS5 proxy started on port $socksPort")
 
             true
         } catch (e: Exception) {
@@ -243,7 +261,10 @@ class SshTunnelClient {
 
                 channel.setHost(host)
                 channel.setPort(port)
-                channel.connect(10000)
+                // DNS-tunneled round trips are much slower than a normal LAN/WAN hop,
+                // especially once the transport's idle poll delay has backed off, so a
+                // channel open can legitimately take several seconds longer than usual.
+                channel.connect(30000)
 
                 // Send success response
                 output.write(byteArrayOf(

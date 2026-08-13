@@ -949,6 +949,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         sshUsername: config.sshUsername!,
         sshPassword: config.sshPassword,
         sshPrivateKey: config.sshPrivateKey,
+        proxyPort: state.proxyPort,
       );
     } else if (isSshTunnel && !useProxyMode) {
       // SSH tunnel in VPN mode - DNSTT + SSH + VPN routing

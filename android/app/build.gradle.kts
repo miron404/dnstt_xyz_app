@@ -51,7 +51,10 @@ android {
     packaging {
         resources {
             excludes += listOf(
-                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+                // Wildcard covers every JDK-version subdirectory (9, 11, 15, ...) that
+                // multi-release jars (jsch, bouncycastle) ship an OSGi manifest under -
+                // several dependencies collide on these paths otherwise.
+                "META-INF/versions/*/OSGI-INF/MANIFEST.MF",
                 "META-INF/DEPENDENCIES",
                 "META-INF/LICENSE",
                 "META-INF/LICENSE.txt",

@@ -691,6 +691,32 @@ class MainActivity : FlutterActivity() {
 
     // SSH tunnel mode methods
     // Flow: DNSTT tunnel (port 7001 internal) -> SSH client -> SSH dynamic port forwarding -> local SOCKS5 proxy (port 1080)
+
+    // The Noise handshake that establishes the DNSTT tunnel itself has a fixed 10s
+    // timeout (go_src/mobile/mobile.go, handshakeTimeout) and can occasionally fail
+    // with "connection timeout: DNS server not responding" on a single slow/cold DNS
+    // round trip. A short retry absorbs that without needing a Go-side change.
+    private suspend fun startSshDnsttTunnel(dnsServer: String, tunnelDomain: String, publicKey: String) {
+        val listenAddr = "127.0.0.1:7001"
+        val maxAttempts = 2
+        var lastException: Exception? = null
+        for (attempt in 1..maxAttempts) {
+            try {
+                sshDnsttClient = Mobile.newClient(dnsServer, tunnelDomain, publicKey, listenAddr)
+                sshDnsttClient?.start()
+                Log.d("DnsttSsh", "DNSTT tunnel started on $listenAddr (attempt $attempt/$maxAttempts)")
+                return
+            } catch (e: Exception) {
+                lastException = e
+                Log.w("DnsttSsh", "DNSTT tunnel start attempt $attempt/$maxAttempts failed: ${e.message}")
+                try { sshDnsttClient?.stop() } catch (_: Exception) {}
+                sshDnsttClient = null
+                if (attempt < maxAttempts) delay(1000)
+            }
+        }
+        throw lastException ?: IllegalStateException("Failed to start DNSTT tunnel")
+    }
+
     private fun connectSshTunnel(
         dnsServer: String,
         tunnelDomain: String,
@@ -712,10 +738,7 @@ class MainActivity : FlutterActivity() {
         proxyScope.launch {
             try {
                 // Step 1: Start DNSTT proxy on internal port 7001 (creates tunnel to SSH server)
-                val listenAddr = "127.0.0.1:7001"
-                sshDnsttClient = Mobile.newClient(dnsServer, tunnelDomain, publicKey, listenAddr)
-                sshDnsttClient?.start()
-                Log.d("DnsttSsh", "DNSTT tunnel started on $listenAddr")
+                startSshDnsttTunnel(dnsServer, tunnelDomain, publicKey)
 
                 // Wait for DNSTT to be ready
                 delay(500)
@@ -867,10 +890,7 @@ class MainActivity : FlutterActivity() {
         proxyScope.launch {
             try {
                 // Step 1: Start DNSTT proxy on internal port 7001
-                val listenAddr = "127.0.0.1:7001"
-                sshDnsttClient = Mobile.newClient(dnsServer, tunnelDomain, publicKey, listenAddr)
-                sshDnsttClient?.start()
-                Log.d("DnsttSsh", "DNSTT tunnel started on $listenAddr")
+                startSshDnsttTunnel(dnsServer, tunnelDomain, publicKey)
 
                 delay(500)
 

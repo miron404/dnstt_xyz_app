@@ -88,49 +88,87 @@ class SshTunnelClient {
                 Security.addProvider(BouncyCastleProvider())
             }
 
-            val jsch = JSch()
+            // The DNS tunnel has a very small per-query payload (see mobile.go's
+            // dnsNameCapacity/MTU calculation), and each round trip can take up to
+            // several seconds once the transport's idle poll delay backs off. JSch's
+            // *default* algorithm lists are large (many legacy entries kept for
+            // compatibility), so the initial KEXINIT alone can take many fragmented
+            // DNS round trips to deliver. Observed failures against a real server:
+            // the SSH banner exchange and key exchange succeeded, but the connection
+            // was then reset (EOF) right as the first post-KEX reply was awaited -
+            // consistent with the tunnel being too slow/flaky for a "chatty" exchange,
+            // not with an algorithm mismatch. Narrowing to a short, modern-only list
+            // shrinks that initial payload and round-trip count, and retrying a few
+            // times absorbs one-off transport hiccups instead of failing on the first.
+            val maxAttempts = 3
+            var connectedSession: Session? = null
+            for (attempt in 1..maxAttempts) {
+                val jsch = JSch()
 
-            // Add private key if provided
-            if (!privateKey.isNullOrEmpty()) {
+                // Add private key if provided
+                if (!privateKey.isNullOrEmpty()) {
+                    try {
+                        jsch.addIdentity("dnstt_key", privateKey.toByteArray(), null, null)
+                        Log.d(TAG, "Added SSH private key")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to add private key: ${e.message}")
+                    }
+                }
+
+                // Create session connecting THROUGH the DNSTT tunnel (127.0.0.1:7001),
+                // which the remote dnstt-server forwards directly to its sshd.
+                val attemptSession = jsch.getSession(username, DNSTT_TUNNEL_HOST, DNSTT_TUNNEL_PORT).apply {
+                    // Set password if provided
+                    if (!password.isNullOrEmpty()) {
+                        setPassword(password)
+                    }
+
+                    // Configure session
+                    val config = Properties().apply {
+                        put("StrictHostKeyChecking", "no")
+                        put("PreferredAuthentications", "publickey,password,keyboard-interactive")
+                        put("compression.s2c", "none")
+                        put("compression.c2s", "none")
+                        put("kex", "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256")
+                        put("server_host_key", "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256")
+                        put("cipher.s2c", "aes128-gcm@openssh.com,aes128-ctr")
+                        put("cipher.c2s", "aes128-gcm@openssh.com,aes128-ctr")
+                        put("mac.s2c", "hmac-sha2-256")
+                        put("mac.c2s", "hmac-sha2-256")
+                    }
+                    setConfig(config)
+
+                    // Set timeouts
+                    timeout = 45000 // 45 seconds connection timeout
+                    setServerAliveInterval(15000) // Keep-alive every 15 seconds
+                    setServerAliveCountMax(3)
+                }
+
+                Log.i(TAG, "Attempting SSH connection as user '$username' (attempt $attempt/$maxAttempts)...")
                 try {
-                    jsch.addIdentity("dnstt_key", privateKey.toByteArray(), null, null)
-                    Log.d(TAG, "Added SSH private key")
+                    attemptSession.connect(45000)
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to add private key: ${e.message}")
+                    lastError = e.message ?: "Unknown SSH error"
+                    Log.w(TAG, "SSH connect attempt $attempt/$maxAttempts failed: $lastError")
+                    try { attemptSession.disconnect() } catch (_: Exception) {}
+                    if (attempt < maxAttempts) {
+                        delay(2000)
+                    }
+                    continue
+                }
+
+                if (attemptSession.isConnected) {
+                    connectedSession = attemptSession
+                    break
                 }
             }
 
-            // Create session connecting THROUGH the DNSTT tunnel (127.0.0.1:7001),
-            // which the remote dnstt-server forwards directly to its sshd.
-            session = jsch.getSession(username, DNSTT_TUNNEL_HOST, DNSTT_TUNNEL_PORT).apply {
-                // Set password if provided
-                if (!password.isNullOrEmpty()) {
-                    setPassword(password)
-                }
-
-                // Configure session
-                val config = Properties().apply {
-                    put("StrictHostKeyChecking", "no")
-                    put("PreferredAuthentications", "publickey,password,keyboard-interactive")
-                    put("compression.s2c", "none")
-                    put("compression.c2s", "none")
-                }
-                setConfig(config)
-
-                // Set timeouts
-                timeout = 30000 // 30 seconds connection timeout
-                setServerAliveInterval(15000) // Keep-alive every 15 seconds
-                setServerAliveCountMax(3)
-            }
-
-            Log.i(TAG, "Attempting SSH connection as user '$username'...")
-            session?.connect(30000)
-
-            if (session?.isConnected != true) {
-                lastError = "SSH session failed to connect"
+            if (connectedSession == null) {
+                lastError = lastError ?: "SSH session failed to connect"
                 Log.e(TAG, lastError!!)
                 return@withContext false
             }
+            session = connectedSession
 
             Log.i(TAG, "SSH session connected successfully")
 

@@ -37,6 +37,49 @@ class SshTunnelClient {
 
         // DnsttVpnService consumes the SSH SOCKS5 proxy on this port.
         private const val SOCKS5_PROXY_PORT = 7000
+
+        // SSH over a DNS tunnel is much slower than a normal network hop: small
+        // per-query payload, and round trips that can take seconds once the
+        // transport's idle poll delay backs off. A full JSch connect() needs more
+        // room than a default SSH client would ever need.
+        private const val TUNNEL_CONNECT_TIMEOUT_MS = 60000
+        private const val CHANNEL_CONNECT_TIMEOUT_MS = 15000
+        private const val CHANNEL_RETRY_COUNT = 2
+        private const val CHANNEL_RETRY_DELAY_MS = 100L
+
+        // Broad, modern algorithm lists (not minimized): prioritize compatibility
+        // with real OpenSSH servers over shrinking the handshake payload size.
+        private const val KEX_ORDER =
+            "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384," +
+                "ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512," +
+                "diffie-hellman-group18-sha512,diffie-hellman-group14-sha256"
+        private const val CIPHER_ORDER =
+            "aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr"
+
+        init {
+            // JSch relies on the JVM's registered security providers to negotiate
+            // KEX/cipher/host-key algorithms. Android's built-in provider (Conscrypt)
+            // does not implement several algorithms modern OpenSSH servers prefer or
+            // require (e.g. curve25519-sha256, ed25519, chacha20-poly1305). Registering
+            // BouncyCastle as an additional (lower-priority) provider lets JSch fall
+            // back to it for anything Conscrypt doesn't support.
+            try {
+                val bcProvider = BouncyCastleProvider()
+                if (Security.getProvider(bcProvider.name) == null) {
+                    Security.addProvider(bcProvider)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to register BouncyCastle provider", e)
+            }
+
+            // JSch's own runtime check for "is this KEX algorithm actually usable"
+            // can incorrectly reject algorithms BC does support on some devices
+            // (provider ordering quirks). Disabling it avoids that false negative;
+            // an actually-unsupported algorithm will still fail at negotiation time
+            // with a clear "Algorithm negotiation fail" instead.
+            JSch.setConfig("CheckKexes", "")
+            JSch.setConfig("kex", KEX_ORDER)
+        }
     }
 
     private var session: Session? = null
@@ -76,30 +119,10 @@ class SshTunnelClient {
             lastError = null
             Log.i(TAG, "Connecting SSH through DNSTT tunnel at $DNSTT_TUNNEL_HOST:$DNSTT_TUNNEL_PORT")
 
-            // JSch relies on the JVM's registered security providers to negotiate
-            // KEX/cipher/host-key algorithms. Android's built-in provider (Conscrypt)
-            // does not implement several algorithms modern OpenSSH servers prefer or
-            // require (e.g. curve25519-sha256, ed25519, chacha20-poly1305), which makes
-            // JSch throw "Algorithm negotiation fail" against such servers. Registering
-            // BouncyCastle as an additional (lower-priority) provider lets JSch fall back
-            // to it for anything Conscrypt doesn't support, without overriding Conscrypt
-            // for what it already handles.
-            if (Security.getProvider("BC") == null) {
-                Security.addProvider(BouncyCastleProvider())
-            }
-
-            // The DNS tunnel has a very small per-query payload (see mobile.go's
-            // dnsNameCapacity/MTU calculation), and each round trip can take up to
-            // several seconds once the transport's idle poll delay backs off. JSch's
-            // *default* algorithm lists are large (many legacy entries kept for
-            // compatibility), so the initial KEXINIT alone can take many fragmented
-            // DNS round trips to deliver. Observed failures against a real server:
-            // the SSH banner exchange and key exchange succeeded, but the connection
-            // was then reset (EOF) right as the first post-KEX reply was awaited -
-            // consistent with the tunnel being too slow/flaky for a "chatty" exchange,
-            // not with an algorithm mismatch. Narrowing to a short, modern-only list
-            // shrinks that initial payload and round-trip count, and retrying a few
-            // times absorbs one-off transport hiccups instead of failing on the first.
+            // A real DNS-tunneled SSH connect has been observed to reach a working
+            // KEX and then die (EOF) right after - consistent with one-off transport
+            // hiccups (packet loss, DPI) rather than a deterministic protocol issue.
+            // Retry a few times with a fresh session before giving up.
             val maxAttempts = 3
             var connectedSession: Session? = null
             for (attempt in 1..maxAttempts) {
@@ -129,24 +152,21 @@ class SshTunnelClient {
                         put("PreferredAuthentications", "publickey,password,keyboard-interactive")
                         put("compression.s2c", "none")
                         put("compression.c2s", "none")
-                        put("kex", "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256")
-                        put("server_host_key", "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256")
-                        put("cipher.s2c", "aes128-gcm@openssh.com,aes128-ctr")
-                        put("cipher.c2s", "aes128-gcm@openssh.com,aes128-ctr")
-                        put("mac.s2c", "hmac-sha2-256")
-                        put("mac.c2s", "hmac-sha2-256")
+                        put("kex", KEX_ORDER)
+                        put("cipher.s2c", CIPHER_ORDER)
+                        put("cipher.c2s", CIPHER_ORDER)
                     }
                     setConfig(config)
 
                     // Set timeouts
-                    timeout = 45000 // 45 seconds connection timeout
+                    timeout = TUNNEL_CONNECT_TIMEOUT_MS
                     setServerAliveInterval(15000) // Keep-alive every 15 seconds
                     setServerAliveCountMax(3)
                 }
 
                 Log.i(TAG, "Attempting SSH connection as user '$username' (attempt $attempt/$maxAttempts)...")
                 try {
-                    attemptSession.connect(45000)
+                    attemptSession.connect(TUNNEL_CONNECT_TIMEOUT_MS)
                 } catch (e: Exception) {
                     lastError = e.message ?: "Unknown SSH error"
                     Log.w(TAG, "SSH connect attempt $attempt/$maxAttempts failed: $lastError")
@@ -289,20 +309,15 @@ class SshTunnelClient {
 
             // Create SSH direct-tcpip channel to forward the connection
             try {
-                val channel = session?.openChannel("direct-tcpip") as? ChannelDirectTCPIP
-                if (channel == null) {
+                val currentSession = session
+                if (currentSession == null) {
                     Log.e(TAG, "Failed to open SSH channel")
                     sendSocksError(output, 0x01)
                     clientSocket.close()
                     return@withContext
                 }
 
-                channel.setHost(host)
-                channel.setPort(port)
-                // DNS-tunneled round trips are much slower than a normal LAN/WAN hop,
-                // especially once the transport's idle poll delay has backed off, so a
-                // channel open can legitimately take several seconds longer than usual.
-                channel.connect(30000)
+                val channel = openChannelWithRetry(currentSession, host, port)
 
                 // Send success response
                 output.write(byteArrayOf(
@@ -359,6 +374,32 @@ class SshTunnelClient {
             Log.e(TAG, "SOCKS client error: ${e.message}")
             try { clientSocket.close() } catch (_: Exception) {}
         }
+    }
+
+    /**
+     * Open an SSH direct-tcpip channel with a short retry, absorbing one-off
+     * transport hiccups on the DNS tunnel instead of failing the whole SOCKS5
+     * request on the first bad round trip.
+     */
+    private fun openChannelWithRetry(session: Session, host: String, port: Int): ChannelDirectTCPIP {
+        var lastException: Exception? = null
+        for (attempt in 0..CHANNEL_RETRY_COUNT) {
+            if (attempt > 0) {
+                Thread.sleep(CHANNEL_RETRY_DELAY_MS)
+            }
+            try {
+                val channel = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
+                channel.setHost(host)
+                channel.setPort(port)
+                channel.connect(CHANNEL_CONNECT_TIMEOUT_MS)
+                return channel
+            } catch (e: Exception) {
+                lastException = e
+                if (!session.isConnected) throw e // session dead, no point retrying
+                Log.w(TAG, "Channel open attempt ${attempt + 1}/${CHANNEL_RETRY_COUNT + 1} failed for $host:$port: ${e.message}")
+            }
+        }
+        throw lastException!!
     }
 
     private fun sendSocksError(output: java.io.OutputStream, errorCode: Int) {
